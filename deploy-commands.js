@@ -1,9 +1,10 @@
 const { REST, Routes } = require('discord.js');
-require('dotenv').config()
 
-var guildId = "961001859659759751"
-var clientId = process.env.appId
+require('dotenv').config()
+var guildId = process.env.guildId
+var applicationId = process.env.applicationId
 var publicKey = process.env.publicKey
+var clientId = process.env.clientId
 var clientSecret = process.env.clientSecret
 var token = process.env.token
 
@@ -14,7 +15,6 @@ const commands = [];
 // Grab all the command folders from the commands directory you created earlier
 const foldersPath = path.join(__dirname, 'commands');
 const commandFolders = fs.readdirSync(foldersPath);
-
 for (const folder of commandFolders) {
 	// Grab all the command files from the commands directory you created earlier
 	const commandsPath = path.join(foldersPath, folder);
