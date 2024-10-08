@@ -24,7 +24,8 @@
 - in discord, run `/getAllChannelMessages`
 
 3. Javascript file that uses google oauth2 to sign in, and create a plstlist and/or add song(s) to a/the playlist
-- Add google OAuth2 vars to .env: `GOOGLE_TOKEN=`
+- Create a GCP project, add API "YouTube Data API v3", create oauth2 credentials with calback url: http://localhost:3000/oauth2callback, add scopes "https://www.googleapis.com/auth/youtube.force-ssl" and "https://www.googleapis.com/auth/youtube"
+- Fill in google OAuth2 vars to .env
 - Run `node youtube-oauth-playlist-adder.js`
 
 4. Discord command to fetch all youtube urls and add them to a playlist
