@@ -1,7 +1,10 @@
 const express = require('express');
 const { google } = require('googleapis');
+const fs = require('fs');
 const readline = require('readline');
-require('dotenv').config()
+require('dotenv').config();
+
+const TOKEN_PATH = 'tokens.json';
 
 var GCP_CLIENT_ID = process.env.GCP_CLIENT_ID;
 var GCP_CLIENT_SECRET = process.env.GCP_CLIENT_SECRET;
@@ -9,7 +12,7 @@ var GCP_CLIENT_SECRET = process.env.GCP_CLIENT_SECRET;
 const app = express();
 const PORT = 3000;
 
-// Replace these with your own OAuth 2.0 credentials
+// OAuth2 client
 const oauth2Client = new google.auth.OAuth2(
     GCP_CLIENT_ID,
     GCP_CLIENT_SECRET,
@@ -30,12 +33,33 @@ const youtube = google.youtube({
     auth: oauth2Client
 });
 
+// Function to load tokens from the JSON file
+function loadTokens() {
+    try {
+        const tokens = JSON.parse(fs.readFileSync(TOKEN_PATH));
+        oauth2Client.setCredentials(tokens);
+        console.log('Tokens loaded from file.');
+        return true;
+    } catch (error) {
+        console.log('No tokens found, starting OAuth flow...');
+        return false;
+    }
+}
+
+// Function to save tokens to the JSON file
+function saveTokens(tokens) {
+    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
+    console.log('Tokens saved to', TOKEN_PATH);
+}
+
+// OAuth2 callback route
 app.get('/oauth2callback', async (req, res) => {
     const { code } = req.query;
     if (code) {
         try {
             const { tokens } = await oauth2Client.getToken(code);
             oauth2Client.setCredentials(tokens);
+            saveTokens(tokens); // Save tokens after successful authentication
             res.send('Authentication successful! You can close this window and return to the console.');
             server.close(() => {
                 console.log('OAuth flow completed. Server closed.');
@@ -50,6 +74,7 @@ app.get('/oauth2callback', async (req, res) => {
     }
 });
 
+// Prompt the user to enter playlist and video URLs
 function promptForPlaylist() {
     rl.question('Enter the YouTube playlist URL: ', (playlistUrl) => {
         const playlistId = extractPlaylistId(playlistUrl);
@@ -70,16 +95,19 @@ function promptForPlaylist() {
     });
 }
 
+// Extract YouTube playlist ID from URL
 function extractPlaylistId(url) {
     const match = url.match(/[?&]list=([^#\&\?]+)/);
     return match && match[1];
 }
 
+// Extract YouTube video ID from URL
 function extractVideoId(url) {
     const match = url.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?(?:embed\/)?(?:v\/)?(?:shorts\/)?([a-zA-Z0-9_-]+)/);
     return match && match[1];
 }
 
+// Add video to YouTube playlist
 async function addVideoToPlaylist(playlistId, videoId) {
     try {
         const response = await youtube.playlistItems.insert({
@@ -102,19 +130,26 @@ async function addVideoToPlaylist(playlistId, videoId) {
     }
 }
 
-const authUrl = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: scopes
-});
+// Start the OAuth flow or use existing tokens
+if (loadTokens()) {
+    // If tokens are loaded, start the video adding process
+    promptForPlaylist();
+} else {
+    // If no tokens are found, start OAuth flow
+    const authUrl = oauth2Client.generateAuthUrl({
+        access_type: 'offline', // Ensures we get a refresh token
+        scope: scopes
+    });
 
-console.log('Please open the following URL in your browser to authenticate:');
-console.log(authUrl);
+    console.log('Please open the following URL in your browser to authenticate:');
+    console.log(authUrl);
 
-// Use dynamic import for the `open` module
-(async () => {
-    const open = (await import('open')).default;
-    open(authUrl);
-})();
+    // Use dynamic import for the `open` module
+    (async () => {
+        const open = (await import('open')).default;
+        open(authUrl);
+    })();
+}
 
 const server = app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
