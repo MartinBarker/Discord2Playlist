@@ -1,5 +1,5 @@
 require('dotenv').config()
-var token = process.env.token
+var token = process.env.DISCORD_TOKEN
 
 const fs = require('node:fs');
 const path = require('node:path');
