@@ -93,7 +93,7 @@ async function isVideoInPlaylist(playlistId, videoId) {
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('getallchannelmessages')
-        .setDescription('v1.1 Fetch all messages, YouTube links, and add them to a playlist'),
+        .setDescription('c v1.1 Fetch all messages, YouTube links, and add them to a playlist'),
     async execute(interaction) {
         await interaction.deferReply();
         const channel = interaction.channel;
