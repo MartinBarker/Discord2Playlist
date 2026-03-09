@@ -1,8 +1,20 @@
 const { SlashCommandBuilder, ChannelType, AttachmentBuilder } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
+const cron = require('node-cron');
+const { CronExpressionParser } = require('cron-parser');
+
+function getNextCronRunTime(expression) {
+    try {
+        const interval = CronExpressionParser.parse(expression);
+        return interval.next().toDate();
+    } catch {
+        return null;
+    }
+}
 
 const OUTPUT_FILENAME_FORMAT = '{sanitized_channel_name}.json';
+const repeatJobs = new Map();
 
 // Find the most recent JSON file for a channel to get last processed message ID
 function getLastProcessedMessageId(channelId, channelName) {
@@ -121,6 +133,51 @@ function mergeMediaArrays(existingArray, incomingArray) {
     return merged;
 }
 
+function getRepeatJobKey(guildId, inputChannelId, outputChannelId) {
+    return `${guildId || 'noguild'}:${inputChannelId}:${outputChannelId}`;
+}
+
+function snowflakeToDate(snowflake) {
+    try {
+        const ms = Number(BigInt(snowflake) >> 22n) + 1420070400000;
+        return new Date(ms).toLocaleString();
+    } catch {
+        return 'unknown';
+    }
+}
+
+function createScheduledInteraction({ client, inputChannel, outputChannel, embeddYoutubeLinks, outputYoutubeLinks, saveJson, repeat }) {
+    return {
+        client,
+        guildId: inputChannel.guildId,
+        channel: inputChannel,
+        options: {
+            getChannel(name) {
+                if (name === 'input_channel') return inputChannel;
+                if (name === 'output_channel') return outputChannel;
+                return null;
+            },
+            getBoolean(name) {
+                if (name === 'embedd_youtube_links') return embeddYoutubeLinks;
+                if (name === 'output_youtube_links') return outputYoutubeLinks;
+                if (name === 'save_json') return saveJson;
+                return null;
+            },
+            getString(name) {
+                if (name === 'repeat') return repeat || null;
+                return null;
+            }
+        },
+        async deferReply() {
+            return;
+        },
+        async editReply(message) {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            console.log(`[Scheduled /makeplaylists] ${text}`);
+        }
+    };
+}
+
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('makeplaylists')
@@ -149,6 +206,11 @@ module.exports = {
             option
                 .setName('save_json')
                 .setDescription('If true, saves all links organized by media source to a JSON file (default: true)')
+                .setRequired(false))
+        .addStringOption(option =>
+            option
+                .setName('repeat')
+                .setDescription('Optional cron expression to repeat this command automatically (e.g. 0 0 */3 * *)')
                 .setRequired(false)),
     async execute(interaction) {
         await interaction.deferReply({ ephemeral: true });
@@ -157,6 +219,12 @@ module.exports = {
         const embeddYoutubeLinks = interaction.options.getBoolean('embedd_youtube_links') || false;
         const outputYoutubeLinks = interaction.options.getBoolean('output_youtube_links') || false;
         const saveJson = interaction.options.getBoolean('save_json') ?? true;
+        const repeat = interaction.options.getString('repeat')?.trim();
+
+        if (repeat && !cron.validate(repeat)) {
+            await interaction.editReply('Invalid cron expression for `repeat`. Example: `0 0 */3 * *`');
+            return;
+        }
 
         // Check if input channel exists and is accessible
         if (!inputChannel) {
@@ -210,12 +278,20 @@ module.exports = {
         console.log(`     - embedd_youtube_links: ${embeddYoutubeLinks}`);
         console.log(`     - output_youtube_links: ${outputYoutubeLinks}`);
         console.log(`     - save_json: ${saveJson}`);
+        if (repeat) {
+            const nextRun = getNextCronRunTime(repeat);
+            console.log(`     - repeat: ${repeat}`);
+            console.log(`     - next run: ${nextRun ? nextRun.toLocaleString() : 'unknown'}`);
+        } else {
+            console.log(`     - repeat: not set — this command will not auto-repeat`);
+        }
         console.log(``);
 
         try {
             let allMessages = [];
-            let lastId;
-            
+            let lastId; // for backward pagination (full mode)
+            let newestFetchedId = null; // for forward pagination (incremental mode)
+
             // Get last processed message ID from the most recent JSON file for this channel
             const lastProcessedMessageId = getLastProcessedMessageId(inputChannel.id, inputChannel.name);
 
@@ -230,48 +306,58 @@ module.exports = {
             const channelName = inputChannel.name || 'Unknown Channel';
 
             if (lastProcessedMessageId) {
+                const lastMsgDate = snowflakeToDate(lastProcessedMessageId);
                 console.log(`Fetching NEW messages from channel: ${channelName} (ID: ${inputChannel.id})`);
-                console.log(`   Last processed message ID: ${lastProcessedMessageId}`);
+                console.log(`   Last processed message: ID ${lastProcessedMessageId} (sent ~${lastMsgDate})`);
+                console.log(`   Fetching messages newer than that...`);
             } else {
                 console.log(`Fetching ALL messages from channel: ${channelName} (ID: ${inputChannel.id}) [First run]`);
             }
 
             while (true) {
                 const options = { limit: 100 };
-                if (lastId) {
+                if (lastProcessedMessageId) {
+                    // Incremental mode: always paginate forward using 'after'
+                    options.after = newestFetchedId || lastProcessedMessageId;
+                } else if (lastId) {
+                    // Full mode: paginate backward
                     options.before = lastId;
-                } else if (lastProcessedMessageId) {
-                    // If we have a last processed message, only fetch messages after it
-                    options.after = lastProcessedMessageId;
                 }
 
                 const messages = await inputChannel.messages.fetch(options);
-                
-                // If using 'after', messages are in ascending order, so reverse to match descending order
+
                 const messageArray = Array.from(messages.values());
-                if (lastProcessedMessageId && !lastId) {
+
+                if (lastProcessedMessageId) {
+                    // 'after' returns ascending order (oldest→newest); track newest for next page
+                    if (messages.size > 0) {
+                        newestFetchedId = messages.last()?.id;
+                    }
+                    // Reverse so newest is first (consistent with full mode processing)
                     messageArray.reverse();
+                } else {
+                    lastId = messages.last()?.id;
                 }
-                
+
                 allMessages = allMessages.concat(messageArray);
-                
-                lastId = messages.last()?.id;
 
                 // Progress log every 500 messages collected
                 if (allMessages.length > 0 && allMessages.length % 500 === 0) {
                     console.log(`   Progress: collected ${allMessages.length} messages so far...`);
                 }
 
-                // If fetching after a specific message (incremental), stop when we've got all new messages
-                if (lastProcessedMessageId && !lastId && messages.size < 100) {
-                    break;
-                }
-
-                if (messages.size != 100 || !lastId) {
-                    break;
-                }
+                if (messages.size < 100) break;
+                if (!lastProcessedMessageId && !lastId) break;
             }
 
+            if (lastProcessedMessageId) {
+                if (allMessages.length === 0) {
+                    console.log(`   No new messages found since last run.`);
+                } else {
+                    const newestDate = snowflakeToDate(newestFetchedId);
+                    console.log(`   Found ${allMessages.length} new messages since last run (newest: ~${newestDate})`);
+                }
+            }
             console.log(`Received ${allMessages.length} messages`);
 
             // Process each message to find music platform links
@@ -546,7 +632,10 @@ module.exports = {
             const youtubeIds = Array.from(mediaLinks.youtube);
             
             // Determine the last processed message ID to save in JSON
-            const newLastProcessedMessageId = allMessages.length > 0 ? allMessages[0].id : lastProcessedMessageId;
+            // Incremental: use newestFetchedId (highest snowflake seen); Full: allMessages[0] is newest
+            const newLastProcessedMessageId = lastProcessedMessageId
+                ? (newestFetchedId || lastProcessedMessageId)
+                : (allMessages.length > 0 ? allMessages[0].id : null);
             
             // Save JSON file with organized media sources if save_json flag is enabled
             if (saveJson) {
@@ -639,6 +728,14 @@ module.exports = {
             response += `🎧 SoundCloud: ${mediaLinks.soundcloud.size}\n`;
             response += `💿 Bandcamp: ${mediaLinks.bandcamp.size}\n\n`;
 
+            if (repeat) {
+                const nextRun = getNextCronRunTime(repeat);
+                response += `🔁 **Auto-repeat:** \`${repeat}\`\n`;
+                response += `⏰ **Next run:** ${nextRun ? `<t:${Math.floor(nextRun.getTime() / 1000)}:F> (<t:${Math.floor(nextRun.getTime() / 1000)}:R>)` : 'unknown'}\n\n`;
+            } else {
+                response += `🔁 **Auto-repeat:** not set — this command will not auto-repeat\n\n`;
+            }
+
             if (youtubeIds.length === 0) {
                 response += `No YouTube links found to create playlists.`;
             } else if (outputYoutubeLinks) {
@@ -660,10 +757,18 @@ module.exports = {
                 const headerContent2 = `🎵 Spotify: ${mediaLinks.spotify.size}\n`;
                 const headerContent3 = `🎧 SoundCloud: ${mediaLinks.soundcloud.size}\n`;
                 const headerContent4 = `💿 Bandcamp: ${mediaLinks.bandcamp.size}\n\n`;
+                let repeatContent = '';
+                if (repeat) {
+                    const nextRun = getNextCronRunTime(repeat);
+                    repeatContent = `🔁 **Auto-repeat:** \`${repeat}\`\n` +
+                        `⏰ **Next run:** ${nextRun ? `<t:${Math.floor(nextRun.getTime() / 1000)}:F> (<t:${Math.floor(nextRun.getTime() / 1000)}:R>)` : 'unknown'}\n\n`;
+                } else {
+                    repeatContent = `🔁 **Auto-repeat:** not set — this command will not auto-repeat\n\n`;
+                }
                 const playlistHeader = `**YouTube Playlists (${playlistUrls.length} playlist${playlistUrls.length > 1 ? 's' : ''}):**\n\n`;
                 
                 // Start with header in first message
-                let currentPart = header + headerContent + headerContent2 + headerContent3 + headerContent4 + playlistHeader;
+                let currentPart = header + headerContent + headerContent2 + headerContent3 + headerContent4 + repeatContent + playlistHeader;
 
                 // Add playlist URLs, splitting when needed
                 playlistUrls.forEach((url, index) => {
@@ -693,10 +798,69 @@ module.exports = {
 
             // Confirm to user
             let confirmMessage = `✅ Successfully created ${playlistUrls.length} YouTube playlist(s) with ${youtubeIds.length} total videos. ${outputChannel.id !== inputChannel.id ? `Sent to ${outputChannel}.` : ''}`;
+
+            if (repeat) {
+                const repeatKey = getRepeatJobKey(interaction.guildId, inputChannel.id, outputChannel.id);
+                const existingJob = repeatJobs.get(repeatKey);
+                if (existingJob) {
+                    existingJob.task.stop();
+                    existingJob.task.destroy();
+                }
+
+                let isRunning = false;
+                const task = cron.schedule(repeat, async () => {
+                    if (isRunning) {
+                        console.log(`[Repeat /makeplaylists] Previous run still active for ${repeatKey}, skipping this tick.`);
+                        return;
+                    }
+
+                    isRunning = true;
+                    try {
+                        const resolvedInput = await interaction.client.channels.fetch(inputChannel.id);
+                        const resolvedOutput = await interaction.client.channels.fetch(outputChannel.id);
+
+                        if (!resolvedInput || resolvedInput.type !== ChannelType.GuildText) {
+                            console.error(`[Repeat /makeplaylists] Input channel unavailable or not text for ${repeatKey}`);
+                            return;
+                        }
+
+                        if (!resolvedOutput || resolvedOutput.type !== ChannelType.GuildText) {
+                            console.error(`[Repeat /makeplaylists] Output channel unavailable or not text for ${repeatKey}`);
+                            return;
+                        }
+
+                        const scheduledInteraction = createScheduledInteraction({
+                            client: interaction.client,
+                            inputChannel: resolvedInput,
+                            outputChannel: resolvedOutput,
+                            embeddYoutubeLinks,
+                            outputYoutubeLinks,
+                            saveJson,
+                            repeat
+                        });
+
+                        await module.exports.execute(scheduledInteraction);
+                    } catch (scheduledError) {
+                        console.error(`[Repeat /makeplaylists] Scheduled run failed for ${repeatKey}:`, scheduledError);
+                    } finally {
+                        isRunning = false;
+                    }
+                });
+
+                repeatJobs.set(repeatKey, { task, repeat });
+                const nextRunTime = getNextCronRunTime(repeat);
+                const nextRunStr = nextRunTime ? nextRunTime.toLocaleString() : 'unknown';
+                confirmMessage += ` Repeat scheduled with cron: \`${repeat}\`. Next run: ${nextRunStr}.`;
+                console.log(`🔁 Repeat scheduled: ${repeat}`);
+                console.log(`⏰ Next run: ${nextRunStr}`);
+            }
             
             await interaction.editReply(confirmMessage);
 
             console.log(`Created ${playlistUrls.length} YouTube playlist(s) with ${youtubeIds.length} total videos`);
+            if (!repeat) {
+                console.log(`🔁 Repeat: not set — this command will not auto-repeat`);
+            }
 
         } catch (error) {
             console.error('Error fetching messages:', error);
@@ -712,4 +876,6 @@ module.exports = {
             await interaction.editReply(errorMessage);
         }
     },
+    repeatJobs,
+    getRepeatJobKey,
 };
