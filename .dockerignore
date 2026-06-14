@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env_template
+.git/
+.gitignore
+.vscode/
+*.md
+*.json
+!package.json
+!package-lock.json
+music-share.json
+youtube-tokens.json
+tokens.json
+config.json

@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, ChannelType, AttachmentBuilder } = require('discord.js');
+const { SlashCommandBuilder, ChannelType } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 const cron = require('node-cron');
@@ -11,6 +11,75 @@ function getNextCronRunTime(expression) {
     } catch {
         return null;
     }
+}
+
+// Plain-English description of a 5-field cron expression. Falls back to
+// computing the gap between two upcoming runs via cron-parser.
+function describeCron(expression) {
+    const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const parts = String(expression || '').trim().split(/\s+/);
+    const fields = parts.length === 6 ? parts.slice(1) : parts; // strip optional seconds field
+    if (fields.length !== 5) return 'custom schedule (unrecognized cron format)';
+
+    const [minute, hour, dom, month, dow] = fields;
+    const isAny = (f) => f === '*';
+    const isZero = (f) => f === '0';
+    const isStep = (f) => /^\*\/\d+$/.test(f);
+    const stepOf = (f) => parseInt(f.split('/')[1], 10);
+    const isInt = (f) => /^\d+$/.test(f);
+
+    let phrase = null;
+    if (isAny(minute) && isAny(hour) && isAny(dom) && isAny(month) && isAny(dow)) {
+        phrase = 'every minute';
+    } else if (isStep(minute) && isAny(hour) && isAny(dom) && isAny(month) && isAny(dow)) {
+        phrase = `every ${stepOf(minute)} minute(s)`;
+    } else if (isZero(minute) && isAny(hour) && isAny(dom) && isAny(month) && isAny(dow)) {
+        phrase = 'every hour, at minute :00';
+    } else if (isZero(minute) && isStep(hour) && isAny(dom) && isAny(month) && isAny(dow)) {
+        phrase = `every ${stepOf(hour)} hour(s), at minute :00`;
+    } else if (isZero(minute) && isZero(hour) && isAny(dom) && isAny(month) && isAny(dow)) {
+        phrase = 'every day at 00:00 UTC';
+    } else if (isZero(minute) && isInt(hour) && isAny(dom) && isAny(month) && isAny(dow)) {
+        phrase = `every day at ${hour.padStart(2, '0')}:00 UTC`;
+    } else if (isZero(minute) && isZero(hour) && isStep(dom) && isAny(month) && isAny(dow)) {
+        phrase = `every ${stepOf(dom)} day(s) at 00:00 UTC`;
+    } else if (isZero(minute) && isZero(hour) && isAny(dom) && isAny(month) && isInt(dow)) {
+        const d = parseInt(dow, 10) % 7;
+        phrase = `every week on ${DOW[d]} at 00:00 UTC`;
+    } else if (isZero(minute) && isZero(hour) && isInt(dom) && isAny(month) && isAny(dow)) {
+        phrase = `on day ${dom} of every month at 00:00 UTC`;
+    }
+
+    // Always append the actual interval between consecutive runs as a sanity check.
+    try {
+        const it = CronExpressionParser.parse(expression);
+        const a = it.next().toDate().getTime();
+        const b = it.next().toDate().getTime();
+        const interval = humanizeMs(b - a);
+        return phrase ? `${phrase} (approx. every ${interval})` : `runs approx. every ${interval}`;
+    } catch {
+        return phrase || 'custom schedule (could not parse)';
+    }
+}
+
+// Render a non-negative millisecond gap as a short human string.
+function humanizeMs(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s} second${s === 1 ? '' : 's'}`;
+    const m = Math.round(s / 60);
+    if (m < 60) return `${m} minute${m === 1 ? '' : 's'}`;
+    const h = Math.round(m / 60);
+    if (h < 24) return `${h} hour${h === 1 ? '' : 's'}`;
+    const d = Math.round(h / 24);
+    return `${d} day${d === 1 ? '' : 's'}`;
+}
+
+// Render a future Date as "in N minutes/hours/days".
+function humanizeUntil(date) {
+    if (!date) return 'unknown';
+    const ms = date.getTime() - Date.now();
+    if (ms <= 0) return 'now';
+    return `in ${humanizeMs(ms)}`;
 }
 
 const OUTPUT_FILENAME_FORMAT = '{sanitized_channel_name}.json';
@@ -146,7 +215,7 @@ function snowflakeToDate(snowflake) {
     }
 }
 
-function createScheduledInteraction({ client, inputChannel, outputChannel, embeddYoutubeLinks, outputYoutubeLinks, saveJson, repeat }) {
+function createScheduledInteraction({ client, inputChannel, outputChannel, embeddYoutubeLinks, outputYoutubeLinks, saveJson, repeat, youtubePlaylistId }) {
     return {
         client,
         guildId: inputChannel.guildId,
@@ -165,6 +234,7 @@ function createScheduledInteraction({ client, inputChannel, outputChannel, embed
             },
             getString(name) {
                 if (name === 'repeat') return repeat || null;
+                if (name === 'youtube_playlist_id') return youtubePlaylistId || null;
                 return null;
             }
         },
@@ -195,7 +265,7 @@ module.exports = {
         .addBooleanOption(option =>
             option
                 .setName('embedd_youtube_links')
-                .setDescription('If true, prevents video embedding by wrapping URLs in angle brackets (default: false)')
+                .setDescription('true = let YouTube links embed previews; false = wrap URLs in <> to suppress embeds (default: false)')
                 .setRequired(false))
         .addBooleanOption(option =>
             option
@@ -209,6 +279,11 @@ module.exports = {
                 .setRequired(false))
         .addStringOption(option =>
             option
+                .setName('youtube_playlist_id')
+                .setDescription('Your YouTube playlist ID — saved to JSON, reused on re-runs, linked in output')
+                .setRequired(false))
+        .addStringOption(option =>
+            option
                 .setName('repeat')
                 .setDescription('Optional cron expression to repeat this command automatically (e.g. 0 0 */3 * *)')
                 .setRequired(false)),
@@ -217,8 +292,9 @@ module.exports = {
         const inputChannel = interaction.options.getChannel('input_channel') || interaction.channel;
         const outputChannel = interaction.options.getChannel('output_channel') || inputChannel;
         const embeddYoutubeLinks = interaction.options.getBoolean('embedd_youtube_links') || false;
-        const outputYoutubeLinks = interaction.options.getBoolean('output_youtube_links') || false;
+        const outputYoutubeLinks = interaction.options.getBoolean('output_youtube_links') ?? true;
         const saveJson = interaction.options.getBoolean('save_json') ?? true;
+        const userProvidedPlaylistId = interaction.options.getString('youtube_playlist_id')?.trim() || null;
         const repeat = interaction.options.getString('repeat')?.trim();
 
         if (repeat && !cron.validate(repeat)) {
@@ -266,24 +342,24 @@ module.exports = {
             return;
         }
 
-        // Print command and flag information
+        // Print command + every flag as the user passed it (or its resolved default).
         console.log(`\n📝 Command: /makeplaylists`);
-        console.log(`   Input Channel: ${inputChannel.name} (ID: ${inputChannel.id})`);
-        if (outputChannel.id !== inputChannel.id) {
-            console.log(`   Output Channel: ${outputChannel.name} (ID: ${outputChannel.id})`);
-        } else {
-            console.log(`   Output Channel: ${outputChannel.name} (ID: ${outputChannel.id}) [same as input]`);
-        }
+        console.log(`   Invoked by: ${interaction.user?.tag || interaction.user?.username || 'unknown'} (ID: ${interaction.user?.id || '?'})`);
+        console.log(`   Guild: ${interaction.guild?.name || 'unknown'} (ID: ${interaction.guildId || '?'})`);
         console.log(`   Flags:`);
+        console.log(`     - input_channel:        #${inputChannel.name} (ID: ${inputChannel.id})`);
+        console.log(`     - output_channel:       #${outputChannel.name} (ID: ${outputChannel.id})${outputChannel.id === inputChannel.id ? '  [defaulted to input_channel]' : ''}`);
         console.log(`     - embedd_youtube_links: ${embeddYoutubeLinks}`);
         console.log(`     - output_youtube_links: ${outputYoutubeLinks}`);
-        console.log(`     - save_json: ${saveJson}`);
+        console.log(`     - save_json:            ${saveJson}`);
+        console.log(`     - youtube_playlist_id:  ${userProvidedPlaylistId || 'not set (will reuse from JSON if present)'}`);
         if (repeat) {
             const nextRun = getNextCronRunTime(repeat);
-            console.log(`     - repeat: ${repeat}`);
-            console.log(`     - next run: ${nextRun ? nextRun.toLocaleString() : 'unknown'}`);
+            console.log(`     - repeat:               ${repeat}`);
+            console.log(`         meaning:            ${describeCron(repeat)}`);
+            console.log(`         next run:           ${nextRun ? nextRun.toLocaleString() : 'unknown'} (${humanizeUntil(nextRun)})`);
         } else {
-            console.log(`     - repeat: not set — this command will not auto-repeat`);
+            console.log(`     - repeat:               not set — this command will not auto-repeat`);
         }
         console.log(``);
 
@@ -628,85 +704,60 @@ module.exports = {
                 });
             });
 
-            // Convert YouTube Set to array and create playlists
-            const youtubeIds = Array.from(mediaLinks.youtube);
-            
             // Determine the last processed message ID to save in JSON
             // Incremental: use newestFetchedId (highest snowflake seen); Full: allMessages[0] is newest
             const newLastProcessedMessageId = lastProcessedMessageId
                 ? (newestFetchedId || lastProcessedMessageId)
                 : (allMessages.length > 0 ? allMessages[0].id : null);
-            
-            // Save JSON file with organized media sources if save_json flag is enabled
+
+            // Load any existing file for this channel so we can detect new-vs-update, merge,
+            // and carry forward the user's youtube_playlist_id across runs.
+            const { botDirectory, filename, filepath } = getChannelJsonPath(inputChannel.name);
+            const existingData = loadExistingJson(filepath, inputChannel.id);
+            const wasUpdating = !!existingData;
+
+            const mergedYoutube = mergeMediaArrays(existingData?.youtube, mediaData.youtube);
+            const mergedSpotify = mergeMediaArrays(existingData?.spotify, mediaData.spotify);
+            const mergedSoundCloud = mergeMediaArrays(existingData?.soundcloud, mediaData.soundcloud);
+            const mergedBandcamp = mergeMediaArrays(existingData?.bandcamp, mediaData.bandcamp);
+
+            const newYoutubeCount = mergedYoutube.length - (existingData?.youtube?.length || 0);
+            const newSpotifyCount = mergedSpotify.length - (existingData?.spotify?.length || 0);
+            const newSoundCloudCount = mergedSoundCloud.length - (existingData?.soundcloud?.length || 0);
+            const newBandcampCount = mergedBandcamp.length - (existingData?.bandcamp?.length || 0);
+            const newTotalCount = newYoutubeCount + newSpotifyCount + newSoundCloudCount + newBandcampCount;
+            const totalInFile = mergedYoutube.length + mergedSpotify.length + mergedSoundCloud.length + mergedBandcamp.length;
+
+            // The playlist ID this run uses: explicit option wins, otherwise reuse whatever's already in the file.
+            const effectiveYoutubePlaylistId = userProvidedPlaylistId || existingData?.youtubePlaylistId || null;
+
+            // Save the JSON file silently (no Discord attachment).
             if (saveJson) {
-                console.log('💾 save_json flag is enabled - preparing to save organized JSON file...');
                 try {
-                    const { botDirectory, filename, filepath } = getChannelJsonPath(inputChannel.name);
-                    const existingData = loadExistingJson(filepath, inputChannel.id);
-
-                    const mergedYoutube = mergeMediaArrays(existingData?.youtube, mediaData.youtube);
-                    const mergedSpotify = mergeMediaArrays(existingData?.spotify, mediaData.spotify);
-                    const mergedSoundCloud = mergeMediaArrays(existingData?.soundcloud, mediaData.soundcloud);
-                    const mergedBandcamp = mergeMediaArrays(existingData?.bandcamp, mediaData.bandcamp);
-
-                    // Build the JSON structure with message objects
                     const jsonData = {
                         channelName: inputChannel.name || 'Unknown Channel',
                         channelId: inputChannel.id,
+                        youtubePlaylistId: effectiveYoutubePlaylistId,
                         dateRan: new Date().toISOString(),
                         lastProcessedMessageId: newLastProcessedMessageId,
-                        totalTracks: mergedYoutube.length + mergedSpotify.length + mergedSoundCloud.length + mergedBandcamp.length,
+                        totalTracks: totalInFile,
                         youtube: mergedYoutube,
                         spotify: mergedSpotify,
                         soundcloud: mergedSoundCloud,
                         bandcamp: mergedBandcamp
                     };
 
-                    console.log(`📁 Saving organized JSON file...`);
-                    console.log(`   📄 Filename: ${filename}`);
-                    console.log(`   📂 Directory: ${botDirectory}`);
-                    console.log(`   🔗 Full Path: ${filepath}`);
-                    console.log(`   📊 Data: ${jsonData.totalTracks} total tracks from channel "${inputChannel.name}"`);
-                    console.log(`   📺 YouTube: ${mergedYoutube.length}`);
-                    console.log(`   🎵 Spotify: ${mergedSpotify.length}`);
-                    console.log(`   🎧 SoundCloud: ${mergedSoundCloud.length}`);
-                    console.log(`   💿 Bandcamp: ${mergedBandcamp.length}`);
+                    console.log(`💾 ${wasUpdating ? 'Updating' : 'Creating'} JSON file: ${filepath}`);
+                    console.log(`   New this run: ${newTotalCount} (YT ${newYoutubeCount} / SP ${newSpotifyCount} / SC ${newSoundCloudCount} / BC ${newBandcampCount})`);
+                    console.log(`   Total in file: ${totalInFile} (YT ${mergedYoutube.length} / SP ${mergedSpotify.length} / SC ${mergedSoundCloud.length} / BC ${mergedBandcamp.length})`);
+                    if (effectiveYoutubePlaylistId) {
+                        console.log(`   youtubePlaylistId: ${effectiveYoutubePlaylistId}`);
+                    }
 
                     fs.writeFileSync(filepath, JSON.stringify(jsonData, null, 2), 'utf8');
-
-                    console.log(`✅ Successfully saved organized JSON file`);
-                    console.log(`   📄 File: ${filename}`);
-                    console.log(`   📂 Location: ${filepath}`);
-
-                    // Send message to Discord about saved JSON file
-                    try {
-                        const jsonAttachment = new AttachmentBuilder(filepath, {
-                            name: filename,
-                            description: `Organized media links from ${inputChannel.name}`
-                        });
-
-                        await outputChannel.send({
-                            content: `💾 **JSON file saved successfully!**\n` +
-                                   `📄 **File:** ${filename}\n` +
-                                   `📊 **Total tracks:** ${jsonData.totalTracks}\n` +
-                                   `   📺 YouTube: ${mergedYoutube.length}\n` +
-                                   `   🎵 Spotify: ${mergedSpotify.length}\n` +
-                                   `   🎧 SoundCloud: ${mergedSoundCloud.length}\n` +
-                                   `   💿 Bandcamp: ${mergedBandcamp.length}`,
-                            files: [jsonAttachment]
-                        });
-
-                        console.log(`✅ Sent JSON file message to ${outputChannel.name}`);
-                    } catch (error) {
-                        console.error('❌ Error sending JSON file message to Discord:', error);
-                        // Don't fail the whole command if message sending fails
-                    }
+                    console.log(`✅ ${wasUpdating ? 'Updated' : 'Created'} ${filename}`);
                 } catch (error) {
-                    console.error('❌ Error saving organized JSON file:');
-                    console.error(`   Error: ${error.message}`);
-                    console.error(`   Stack: ${error.stack}`);
-
-                    // Send error message to Discord
+                    console.error('❌ Error saving JSON file:', error);
                     try {
                         await outputChannel.send(`❌ **Error saving JSON file:** ${error.message}`);
                     } catch (sendError) {
@@ -714,97 +765,100 @@ module.exports = {
                     }
                 }
             }
-            
-            const playlistChunks = chunkArray(youtubeIds, 50);
-            const playlistUrls = playlistChunks.map(chunk => {
-                const idsString = chunk.join(',');
-                return `http://www.youtube.com/watch_videos?video_ids=${idsString}`;
-            });
 
-            // Build response message with plain URLs (no markdown links)
-            let response = `**Media Links Found:**\n`;
-            response += `📺 YouTube: ${mediaLinks.youtube.size}\n`;
-            response += `🎵 Spotify: ${mediaLinks.spotify.size}\n`;
-            response += `🎧 SoundCloud: ${mediaLinks.soundcloud.size}\n`;
-            response += `💿 Bandcamp: ${mediaLinks.bandcamp.size}\n\n`;
+            // Build YouTube playlists from EVERY unique video ID in the file (not just this run's),
+            // so the user always sees the full library of 50-video chunks.
+            const allYouTubeIdsInFile = Array.from(new Set(mergedYoutube.map(item => item.id).filter(Boolean)));
+            const playlistChunks = chunkArray(allYouTubeIdsInFile, 50);
+            const playlistUrls = playlistChunks.map(chunk =>
+                `http://www.youtube.com/watch_videos?video_ids=${chunk.join(',')}`
+            );
+
+            // ── Build the summary message ────────────────────────────────────────────
+            let summary = wasUpdating
+                ? `🔄 **Updated existing file** \`${filename}\`\n\n`
+                : `🆕 **Created new file** \`${filename}\`\n\n`;
+
+            if (newTotalCount > 0) {
+                summary += `**🆕 New links this run: ${newTotalCount}**\n`;
+                if (newYoutubeCount    > 0) summary += `   📺 YouTube: ${newYoutubeCount}\n`;
+                if (newSpotifyCount    > 0) summary += `   🎵 Spotify: ${newSpotifyCount}\n`;
+                if (newSoundCloudCount > 0) summary += `   🎧 SoundCloud: ${newSoundCloudCount}\n`;
+                if (newBandcampCount   > 0) summary += `   💿 Bandcamp: ${newBandcampCount}\n`;
+                summary += `\n`;
+            }
+
+            summary += `**📊 Total in file: ${totalInFile}**\n`;
+            summary += `   📺 YouTube: ${mergedYoutube.length}\n`;
+            summary += `   🎵 Spotify: ${mergedSpotify.length}\n`;
+            summary += `   🎧 SoundCloud: ${mergedSoundCloud.length}\n`;
+            summary += `   💿 Bandcamp: ${mergedBandcamp.length}\n\n`;
+
+            if (effectiveYoutubePlaylistId) {
+                // Always naked URL so Discord renders the playlist preview card.
+                // (The embedd_youtube_links flag only suppresses the 50-video chunk URLs.)
+                summary += `🎵 **Your YouTube Playlist:** https://www.youtube.com/playlist?list=${effectiveYoutubePlaylistId}\n\n`;
+            }
 
             if (repeat) {
                 const nextRun = getNextCronRunTime(repeat);
-                response += `🔁 **Auto-repeat:** \`${repeat}\`\n`;
-                response += `⏰ **Next run:** ${nextRun ? `<t:${Math.floor(nextRun.getTime() / 1000)}:F> (<t:${Math.floor(nextRun.getTime() / 1000)}:R>)` : 'unknown'}\n\n`;
-            } else {
-                response += `🔁 **Auto-repeat:** not set — this command will not auto-repeat\n\n`;
+                summary += `🔁 **Auto-repeat:** \`${repeat}\`\n`;
+                summary += `⏰ **Next run:** ${nextRun ? `<t:${Math.floor(nextRun.getTime() / 1000)}:F> (<t:${Math.floor(nextRun.getTime() / 1000)}:R>)` : 'unknown'}\n\n`;
             }
 
-            if (youtubeIds.length === 0) {
-                response += `No YouTube links found to create playlists.`;
-            } else if (outputYoutubeLinks) {
-                response += `**YouTube Playlists (${playlistUrls.length} playlist${playlistUrls.length > 1 ? 's' : ''}):**\n\n`;
-                playlistUrls.forEach((url, index) => {
-                    const urlFormat = embeddYoutubeLinks ? url : `<${url}>`;
-                    response += `[YouTube Playlist ${index + 1} (${playlistChunks[index].length} videos)](${urlFormat})\n`;
-                });
-            } else {
-                response += `YouTube playlists generated but not posted (output_youtube_links=false).`;
+            if (allYouTubeIdsInFile.length === 0) {
+                summary += `_No YouTube links in this channel yet._`;
+            } else if (!outputYoutubeLinks) {
+                summary += `_${playlistUrls.length} YouTube playlist link${playlistUrls.length === 1 ? '' : 's'} generated but not posted (\`output_youtube_links\`=false)._`;
             }
 
-            // Discord has a 2000 character limit for messages
-            // If message is too long, we'll need to split it intelligently
-            if (outputYoutubeLinks && response.length > 2000) {
-                const parts = [];
-                const header = `**Media Links Found:**\n`;
-                const headerContent = `📺 YouTube: ${mediaLinks.youtube.size}\n`;
-                const headerContent2 = `🎵 Spotify: ${mediaLinks.spotify.size}\n`;
-                const headerContent3 = `🎧 SoundCloud: ${mediaLinks.soundcloud.size}\n`;
-                const headerContent4 = `💿 Bandcamp: ${mediaLinks.bandcamp.size}\n\n`;
-                let repeatContent = '';
-                if (repeat) {
-                    const nextRun = getNextCronRunTime(repeat);
-                    repeatContent = `🔁 **Auto-repeat:** \`${repeat}\`\n` +
-                        `⏰ **Next run:** ${nextRun ? `<t:${Math.floor(nextRun.getTime() / 1000)}:F> (<t:${Math.floor(nextRun.getTime() / 1000)}:R>)` : 'unknown'}\n\n`;
-                } else {
-                    repeatContent = `🔁 **Auto-repeat:** not set — this command will not auto-repeat\n\n`;
-                }
-                const playlistHeader = `**YouTube Playlists (${playlistUrls.length} playlist${playlistUrls.length > 1 ? 's' : ''}):**\n\n`;
-                
-                // Start with header in first message
-                let currentPart = header + headerContent + headerContent2 + headerContent3 + headerContent4 + repeatContent + playlistHeader;
+            await outputChannel.send(summary.trim());
 
-                // Add playlist URLs, splitting when needed
-                playlistUrls.forEach((url, index) => {
-                    const urlFormat = embeddYoutubeLinks ? url : `<${url}>`;
-                    const playlistLine = `[YouTube Playlist ${index + 1} (${playlistChunks[index].length} videos)](${urlFormat})\n`;
-                    // Check if adding this line would exceed limit (leave some buffer)
-                    if (currentPart.length + playlistLine.length > 1950) {
-                        parts.push(currentPart.trim());
-                        currentPart = playlistLine;
+            // ── Post inline numbered playlist links: [1](url), [2](url), [3](url), … ──
+            // Each link renders as just the number; whole list flows like "1, 2, 3, 4, …"
+            // with no newlines between links. The header gets its own message so the
+            // link list stays on a single flowing line (modulo Discord's 2000-char split).
+            if (outputYoutubeLinks && playlistUrls.length > 0) {
+                await outputChannel.send(`**📺 YouTube playlists (${playlistUrls.length} × up to 50 videos):**`);
+
+                const SEP = ', ';
+                const chunks = [];
+                let current = '';
+                for (let i = 0; i < playlistUrls.length; i++) {
+                    // [N](<url>) form suppresses Discord's link-preview embed; [N](url) allows it.
+                    const url = embeddYoutubeLinks ? playlistUrls[i] : `<${playlistUrls[i]}>`;
+                    const link = `[${i + 1}](${url})`;
+                    const addition = current.length === 0 ? link : SEP + link;
+                    if (current.length + addition.length > 1950) {
+                        chunks.push(current);
+                        current = link;
                     } else {
-                        currentPart += playlistLine;
+                        current += addition;
                     }
-                });
-                
-                // Add remaining content
-                if (currentPart.length > 0) {
-                    parts.push(currentPart.trim());
                 }
+                if (current.length > 0) chunks.push(current);
 
-                // Send all parts to output channel
-                for (const part of parts) {
-                    await outputChannel.send(part);
+                for (const chunk of chunks) {
+                    await outputChannel.send(chunk);
                 }
-            } else {
-                await outputChannel.send(response);
             }
 
-            // Confirm to user
-            let confirmMessage = `✅ Successfully created ${playlistUrls.length} YouTube playlist(s) with ${youtubeIds.length} total videos. ${outputChannel.id !== inputChannel.id ? `Sent to ${outputChannel}.` : ''}`;
+            // ── Confirm back to the invoker ─────────────────────────────────────────
+            let confirmMessage =
+                `✅ ${wasUpdating ? 'Updated' : 'Created'} \`${filename}\`. ` +
+                `${newTotalCount} new link${newTotalCount === 1 ? '' : 's'} added, ` +
+                `${totalInFile} total in file. ` +
+                `${playlistUrls.length} YouTube playlist link${playlistUrls.length === 1 ? '' : 's'} ` +
+                `${outputYoutubeLinks ? 'posted' : 'generated (not posted)'}.` +
+                `${outputChannel.id !== inputChannel.id ? ` Sent to ${outputChannel}.` : ''}`;
 
             if (repeat) {
                 const repeatKey = getRepeatJobKey(interaction.guildId, inputChannel.id, outputChannel.id);
                 const existingJob = repeatJobs.get(repeatKey);
                 if (existingJob) {
+                    // node-cron v3 only exposes .stop() — .destroy() was removed.
                     existingJob.task.stop();
-                    existingJob.task.destroy();
+                    repeatJobs.delete(repeatKey);
                 }
 
                 let isRunning = false;
@@ -836,7 +890,8 @@ module.exports = {
                             embeddYoutubeLinks,
                             outputYoutubeLinks,
                             saveJson,
-                            repeat
+                            repeat,
+                            youtubePlaylistId: effectiveYoutubePlaylistId
                         });
 
                         await module.exports.execute(scheduledInteraction);
@@ -857,23 +912,26 @@ module.exports = {
             
             await interaction.editReply(confirmMessage);
 
-            console.log(`Created ${playlistUrls.length} YouTube playlist(s) with ${youtubeIds.length} total videos`);
+            console.log(`${wasUpdating ? 'Updated' : 'Created'} ${filename}: +${newTotalCount} new, ${totalInFile} total, ${playlistUrls.length} playlist link(s) over ${allYouTubeIdsInFile.length} unique YouTube videos`);
             if (!repeat) {
                 console.log(`🔁 Repeat: not set — this command will not auto-repeat`);
             }
 
         } catch (error) {
-            console.error('Error fetching messages:', error);
-            let errorMessage = `An error occurred while fetching messages and creating playlists: ${error.message}`;
-            
-            // Provide more helpful error messages for common permission issues
+            // Errors stay in the bot console — never surfaced to Discord as user-visible text.
+            console.error('❌ /makeplaylists failed:', error);
             if (error.code === 50001) {
-                errorMessage = `Missing Access: The bot does not have permission to access the output channel (${outputChannel.name}). Please ensure the bot has "View Channel" and "Send Messages" permissions in that channel.`;
+                console.error(`   → Missing Access on output channel #${outputChannel?.name}. Bot needs View Channel + Send Messages.`);
             } else if (error.code === 50013) {
-                errorMessage = `Missing Permissions: The bot is missing required permissions. Please check that the bot has "View Channel", "Send Messages", and "Read Message History" permissions.`;
+                console.error('   → Missing Permissions. Bot needs View Channel + Send Messages + Read Message History.');
             }
-            
-            await interaction.editReply(errorMessage);
+
+            // Discord still requires a reply after deferReply(); use a neutral ack so no error text leaks.
+            try {
+                await interaction.editReply('Done.');
+            } catch (replyErr) {
+                console.error('   → Could not edit reply:', replyErr.message);
+            }
         }
     },
     repeatJobs,

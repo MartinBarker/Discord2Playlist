@@ -40,8 +40,76 @@ const CONFIG = {
   BACKOFF_MULTIPLIER: 2,
 };
 
+// ─── YouTube Data API v3 quota tracking ─────────────────────────────────────
+// Reference: https://developers.google.com/youtube/v3/determine_quota_cost
+// Every API call (even failed ones) counts against your daily quota, so we log
+// every attempt before it fires.
+const QUOTA_COSTS = {
+  'playlistItems.list':   1,
+  'playlistItems.insert': 50,
+  'playlistItems.delete': 50,
+  'playlists.list':       1,
+  'playlists.insert':     50,
+  'playlists.update':     50,
+  'videos.list':          1,
+  'search.list':          100,
+};
+const DAILY_QUOTA = 10000;            // default project-wide quota
+const QUOTA_WARN_THRESHOLD = 0.8;     // log a loud warning above 80% used
+
+const quotaState = {
+  used: 0,
+  byOp: {},
+};
+
+function trackQuota(operation) {
+  const cost = QUOTA_COSTS[operation];
+  if (cost === undefined) {
+    console.warn(`⚠ Unknown quota cost for "${operation}" — not tracking. Add it to QUOTA_COSTS.`);
+    return;
+  }
+  quotaState.used += cost;
+  quotaState.byOp[operation] = (quotaState.byOp[operation] || 0) + 1;
+  const remaining = Math.max(0, DAILY_QUOTA - quotaState.used);
+  const pct = ((quotaState.used / DAILY_QUOTA) * 100).toFixed(1);
+  const warn = quotaState.used >= DAILY_QUOTA * QUOTA_WARN_THRESHOLD ? '  ⚠️  NEAR LIMIT' : '';
+  console.log(`🪙 quota +${cost} ${operation} → ${quotaState.used}/${DAILY_QUOTA} used (${pct}%, ${remaining} left)${warn}`);
+}
+
+function logQuotaSummary() {
+  console.log('\n📊 YouTube API quota usage (this run only):');
+  console.log(`   Total: ${quotaState.used} units / ${DAILY_QUOTA} daily quota (${((quotaState.used / DAILY_QUOTA) * 100).toFixed(1)}%)`);
+  const ops = Object.entries(quotaState.byOp).sort((a, b) => b[1] - a[1]);
+  if (ops.length === 0) {
+    console.log('   No API calls were made.');
+  } else {
+    for (const [op, count] of ops) {
+      const opCost = QUOTA_COSTS[op] * count;
+      console.log(`   ${op.padEnd(24)} × ${String(count).padStart(5)} call(s) = ${opCost} units`);
+    }
+  }
+  console.log('   ⚠️  This is THIS RUN only — does not include earlier runs today.');
+  console.log('   Daily quota resets at midnight Pacific time.');
+  console.log('   Live usage:  https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas\n');
+}
+
+// Print summary even if the user Ctrl+C's mid-run
+process.on('SIGINT', () => {
+  console.log('\n⏹  Interrupted by user.');
+  logQuotaSummary();
+  process.exit(130);
+});
+
 // Scopes for YouTube Data API
 const SCOPES = ['https://www.googleapis.com/auth/youtube'];
+
+// ─── CLI flags ──────────────────────────────────────────────────────────────
+// --skip-prefetch : Don't call playlistItems.list to discover the existing
+//                   playlist. Trust the JSON's `added_to_playlist` field as
+//                   the sole source of truth. Saves ~1 unit per 50 videos
+//                   already in the playlist (huge win on large playlists).
+//                   Off by default — pre-fetch still runs unless this flag is set.
+const SKIP_PREFETCH = process.argv.slice(2).includes('--skip-prefetch');
 
 /**
  * Start a local web server to capture OAuth callback
@@ -276,12 +344,15 @@ async function getAllPlaylistVideoIds(youtube, playlistId) {
   do {
     try {
       const response = await retryForeverOnQuota(
-        () => youtube.playlistItems.list({
-          part: 'contentDetails',
-          playlistId: playlistId,
-          maxResults: 50,
-          pageToken: nextPageToken
-        }),
+        () => {
+          trackQuota('playlistItems.list');
+          return youtube.playlistItems.list({
+            part: 'contentDetails',
+            playlistId: playlistId,
+            maxResults: 50,
+            pageToken: nextPageToken
+          });
+        },
         'fetching playlist items'
       );
 
@@ -310,6 +381,7 @@ async function addVideoToPlaylist(youtube, playlistId, videoId) {
 
   while (true) {
     try {
+      trackQuota('playlistItems.insert');
       await youtube.playlistItems.insert({
         part: 'snippet',
         requestBody: {
@@ -419,7 +491,8 @@ async function updateJsonFile(data, videoIds, status = true) {
  */
 async function main() {
   try {
-    console.log('🚀 Starting YouTube Playlist Sync...\n');
+    console.log('🚀 Starting YouTube Playlist Sync...');
+    console.log(`   Flags: --skip-prefetch=${SKIP_PREFETCH ? 'ON' : 'off'}\n`);
 
     // Validate environment variables
     if (!process.env.GCP_CLIENT_ID || !process.env.GCP_CLIENT_SECRET) {
@@ -445,20 +518,28 @@ async function main() {
       return;
     }
 
-    // Fetch all existing playlist video IDs
-    console.log('🔍 Fetching existing playlist videos...');
-    const existingVideoIds = await getAllPlaylistVideoIds(youtube, YOUTUBE_PLAYLIST_ID);
-    console.log(`✓ Playlist contains ${existingVideoIds.size} videos\n`);
+    // Decide what to add — either by cross-checking the existing playlist on YouTube,
+    // or (with --skip-prefetch) trusting the JSON's `added_to_playlist` field alone.
+    let videosToAdd;
+    if (SKIP_PREFETCH) {
+      console.log('⏭  --skip-prefetch enabled: trusting JSON `added_to_playlist` field, not querying YouTube for existing playlist contents.');
+      console.log('   (Saves ~1 quota unit per 50 existing videos. Risk: if a video was manually removed from the playlist, it stays marked as added in JSON and will not be re-added.)\n');
+      videosToAdd = videoIds;
+    } else {
+      console.log('🔍 Fetching existing playlist videos... (use --skip-prefetch to skip this step)');
+      const existingVideoIds = await getAllPlaylistVideoIds(youtube, YOUTUBE_PLAYLIST_ID);
+      console.log(`✓ Playlist contains ${existingVideoIds.size} videos\n`);
 
-    // Separate videos into those already in playlist vs those to add
-    const alreadyInPlaylist = videoIds.filter(id => existingVideoIds.has(id));
-    const videosToAdd = videoIds.filter(id => !existingVideoIds.has(id));
+      // Separate videos into those already in playlist vs those to add
+      const alreadyInPlaylist = videoIds.filter(id => existingVideoIds.has(id));
+      videosToAdd = videoIds.filter(id => !existingVideoIds.has(id));
 
-    // Mark videos already in playlist as added
-    if (alreadyInPlaylist.length > 0) {
-      console.log(`📝 Marking ${alreadyInPlaylist.length} videos as already in playlist...`);
-      await updateJsonFile(musicData, alreadyInPlaylist, true);
-      console.log('✓ JSON file updated\n');
+      // Mark videos already in playlist as added
+      if (alreadyInPlaylist.length > 0) {
+        console.log(`📝 Marking ${alreadyInPlaylist.length} videos as already in playlist...`);
+        await updateJsonFile(musicData, alreadyInPlaylist, true);
+        console.log('✓ JSON file updated\n');
+      }
     }
 
     console.log(`➕ ${videosToAdd.length} videos need to be added\n`);
@@ -500,6 +581,7 @@ async function main() {
       failedWithError.forEach(id => console.log(`   - ${id}`));
     }
     console.log(`📝 JSON file updated with added_to_playlist status.`);
+    logQuotaSummary();
 
   } catch (error) {
     console.error('\n❌ Fatal error occurred:');
@@ -509,6 +591,7 @@ async function main() {
     }
     console.error('Script stopped.');
     console.error('Progress has been saved to JSON file.');
+    logQuotaSummary();
     process.exit(1);
   }
 }

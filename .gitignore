@@ -4,3 +4,4 @@ config.json
 package-lock.json
 tokens.json
 youtube-tokens.json
+task-definition.json
