@@ -1,47 +1,36 @@
+// /stop — disable all scheduled scans in this server. Clears the cron on each
+// scan_job and unregisters it from the scheduler.
 const { SlashCommandBuilder } = require('discord.js');
-const makePlaylists = require('./makePlaylists.js');
+const db = require('../db');
+const { rescheduleJob } = require('../lib/scheduler');
 
 module.exports = {
-    data: new SlashCommandBuilder()
-        .setName('stop')
-        .setDescription('Stop all scheduled /makeplaylists auto-runs in this server'),
-    async execute(interaction) {
-        const { repeatJobs, getRepeatJobKey } = makePlaylists;
-        const guildId = interaction.guildId;
+  data: new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('Stop all scheduled scans in this server'),
 
-        if (!guildId) {
-            await interaction.reply({ content: 'This command must be used in a server.', ephemeral: true });
-            return;
-        }
+  async execute(interaction) {
+    if (!interaction.guild) {
+      return interaction.reply({ content: 'This command must be used in a server.', ephemeral: true });
+    }
 
-        const prefix = `${guildId}:`;
-        const stopped = [];
-        for (const [key, job] of repeatJobs) {
-            if (key.startsWith(prefix)) {
-                try {
-                    job.task.stop();
-                    if (typeof job.task.destroy === 'function') {
-                        job.task.destroy();
-                    }
-                    repeatJobs.delete(key);
-                    const [, inputId, outputId] = key.split(':');
-                    stopped.push({ inputId, outputId, repeat: job.repeat });
-                } catch (err) {
-                    console.error(`[Stop] Error stopping job ${key}:`, err);
-                }
-            }
-        }
+    const { rows } = await db.query(
+      `UPDATE scan_jobs
+       SET cron_expression = NULL, is_active = false
+       WHERE guild_id = $1 AND cron_expression IS NOT NULL
+       RETURNING id`,
+      [interaction.guild.id]
+    );
 
-        if (stopped.length === 0) {
-            await interaction.reply({ content: 'No scheduled auto-runs found in this server.', ephemeral: true });
-            return;
-        }
+    for (const row of rows) await rescheduleJob(row.id, null);
 
-        const list = stopped.map(s => `• \`${s.repeat}\` (input: <#${s.inputId}> → output: <#${s.outputId}>)`).join('\n');
-        await interaction.reply({
-            content: `**Stopped ${stopped.length} scheduled auto-run(s):**\n${list}`,
-            ephemeral: true
-        });
-        console.log(`[Stop] Stopped ${stopped.length} scheduled job(s) in guild ${guildId}`);
-    },
+    if (rows.length === 0) {
+      return interaction.reply({ content: 'No scheduled scans found in this server.', ephemeral: true });
+    }
+    await interaction.reply({
+      content: `Stopped ${rows.length} scheduled scan${rows.length === 1 ? '' : 's'}.`,
+      ephemeral: true,
+    });
+    console.log(`[Stop] Cleared ${rows.length} scheduled job(s) in guild ${interaction.guild.id}`);
+  },
 };
