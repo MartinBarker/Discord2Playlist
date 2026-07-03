@@ -8,6 +8,9 @@ if (!token) {
 const fs = require('node:fs');
 const path = require('node:path');
 const { Client, Collection, GatewayIntentBits } = require('discord.js');
+const db = require('./db');
+const { createApiServer } = require('./api/server');
+const scheduler = require('./lib/scheduler');
 
 const client = new Client({
     intents: [
@@ -48,10 +51,39 @@ for (const folder of commandFolders) {
     }
 }
 
-// Event listeners
-client.once('clientReady', () => {
+// ---- HTTP API ----
+// Start the Express API immediately so the health check and the website's
+// OAuth/SSE calls have an endpoint even before the gateway connects.
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const api = createApiServer();
+api.listen(PORT, () => console.log(`Express API listening on :${PORT}`));
+
+// ---- Discord events ----
+client.once('clientReady', async () => {
     console.log(`✅ Bot is ready! Logged in as ${client.user.tag}`);
     console.log(`📊 Loaded ${client.commands.size} command(s)`);
+    // Give the scheduler a client and restore any persisted schedules.
+    scheduler.setClient(client);
+    try {
+        await scheduler.rehydrateAll();
+    } catch (err) {
+        console.error('Failed to rehydrate scheduled scans:', err);
+    }
+});
+
+// Track new servers the bot is added to.
+client.on('guildCreate', async (guild) => {
+    try {
+        await db.query(
+            `INSERT INTO guilds (guild_id, guild_name)
+             VALUES ($1, $2)
+             ON CONFLICT (guild_id) DO UPDATE SET guild_name = $2`,
+            [guild.id, guild.name]
+        );
+        console.log(`➕ Joined guild ${guild.name} (${guild.id})`);
+    } catch (err) {
+        console.error(`Failed to record guildCreate for ${guild.id}:`, err);
+    }
 });
 
 client.on('interactionCreate', async interaction => {

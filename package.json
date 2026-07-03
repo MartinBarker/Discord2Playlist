@@ -1,6 +1,6 @@
 {
   "name": "discord2playlist",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "main": "index.js",
   "scripts": {
     "deploy": "node deploy_discord_commands.js",

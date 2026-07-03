@@ -18,6 +18,8 @@ COPY add_to_youtube_playlist.js ./
 COPY youtube-sync-scheduler.js ./
 COPY commands/ ./commands/
 COPY db/ ./db/
+COPY lib/ ./lib/
+COPY api/ ./api/
 
 # Create data directory for any runtime files (JSON exports, tokens)
 RUN mkdir -p /app/data && chown -R botuser:botgroup /app/data
@@ -25,8 +27,10 @@ RUN mkdir -p /app/data && chown -R botuser:botgroup /app/data
 # Switch to non-root user
 USER botuser
 
-# Health check — bot process should be running
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "process.exit(0)" || exit 1
+EXPOSE 3000
+
+# Health check — the Express API must answer on /healthz
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD node -e "require('http').get('http://127.0.0.1:'+(process.env.PORT||3000)+'/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
 CMD ["node", "start_discord_bot.js"]
