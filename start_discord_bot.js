@@ -53,9 +53,10 @@ for (const folder of commandFolders) {
 
 // ---- HTTP API ----
 // Start the Express API immediately so the health check and the website's
-// OAuth/SSE calls have an endpoint even before the gateway connects.
+// OAuth/SSE calls have an endpoint even before the gateway connects. The client
+// is handed over now but only used at request time, once it's logged in.
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const api = createApiServer();
+const api = createApiServer({ discordClient: client });
 api.listen(PORT, () => console.log(`Express API listening on :${PORT}`));
 
 // ---- Discord events ----
