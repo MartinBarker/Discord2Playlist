@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS youtube_tokens (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Per-(scan, user, video) push status — drives the retry/resume logic
+-- Per-(scan, user, playlist, video) push status — drives the retry/resume logic
 CREATE TABLE IF NOT EXISTS playlist_items (
     id                  SERIAL PRIMARY KEY,
     scan_job_id         INTEGER NOT NULL REFERENCES scan_jobs(id) ON DELETE CASCADE,
@@ -79,9 +79,38 @@ CREATE TABLE IF NOT EXISTS playlist_items (
     error               TEXT,
     attempts            INTEGER NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (scan_job_id, discord_user_id, media_id)
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Uniqueness includes the playlist: a user may push the same scan to more than
+-- one playlist, and "already inserted" is only true per target playlist.
+--
+-- Pre-existing databases still carry the old UNIQUE (scan_job_id,
+-- discord_user_id, media_id) constraint, which would reject the second
+-- playlist. Drop it by matching its columns rather than its generated name.
+DO $migrate_playlist_items$
+DECLARE
+    old_constraint TEXT;
+BEGIN
+    SELECT c.conname INTO old_constraint
+    FROM pg_constraint c
+    WHERE c.conrelid = 'playlist_items'::regclass
+      AND c.contype = 'u'
+      AND (
+        SELECT array_agg(a.attname ORDER BY a.attname)
+        FROM unnest(c.conkey) AS k
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k
+      ) = ARRAY['discord_user_id', 'media_id', 'scan_job_id']::name[]
+    LIMIT 1;
+
+    IF old_constraint IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE playlist_items DROP CONSTRAINT %I', old_constraint);
+    END IF;
+END
+$migrate_playlist_items$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_playlist_items_scan_user_playlist_media
+    ON playlist_items(scan_job_id, discord_user_id, youtube_playlist_id, media_id);
 
 -- Stores the resolved YouTube playlist per (scan_job, user) so re-runs
 -- and scheduled pushes target the same playlist.
@@ -92,6 +121,10 @@ CREATE TABLE IF NOT EXISTS scan_playlists (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (scan_job_id, discord_user_id)
 );
+
+-- Cached title of the target playlist, so the results page can name it without
+-- spending a YouTube API call on every page load.
+ALTER TABLE scan_playlists ADD COLUMN IF NOT EXISTS youtube_playlist_title TEXT;
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_scan_jobs_guild

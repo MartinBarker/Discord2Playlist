@@ -6,10 +6,63 @@
 const express = require('express');
 const db = require('../db');
 const { verifyMagicToken } = require('../lib/magicToken');
-const { buildAuthUrl, exchangeCodeAndStore, hasYouTubeTokens, pushPendingToPlaylist } = require('../lib/youtube');
+const {
+  buildAuthUrl,
+  exchangeCodeAndStore,
+  hasYouTubeTokens,
+  getYouTubeChannel,
+  listPlaylists,
+  getSavedPlaylist,
+  pushPendingToPlaylist,
+  classifyError,
+  PRIVACY_STATUSES,
+  INSERT_QUOTA_COST,
+} = require('../lib/youtube');
 const { encodeState, decodeState } = require('../lib/oauthState');
 
-function createApiServer() {
+// Best-effort Discord channel/guild names for the results page's auto-add
+// instructions. Never fails the request — the page falls back to raw ids.
+async function resolveNames(discordClient, scanJob) {
+  const names = { guildName: null, inputChannelName: null, outputChannelName: null };
+  if (!discordClient) return names;
+  const channelName = async id => {
+    if (!id) return null;
+    try {
+      const ch = await discordClient.channels.fetch(id);
+      return ch?.name || null;
+    } catch {
+      return null;
+    }
+  };
+  try {
+    const guild = await discordClient.guilds.fetch(scanJob.guild_id);
+    names.guildName = guild?.name || null;
+  } catch {}
+  names.inputChannelName = await channelName(scanJob.input_channel_id);
+  names.outputChannelName = await channelName(scanJob.output_channel_id);
+  return names;
+}
+
+// Turn the SSE query string into the options bag pushPendingToPlaylist expects.
+// EventSource can only issue GETs with no custom headers, so the playlist choice
+// travels as query params.
+function parsePushOptions(query) {
+  if (query.playlistId) return { playlistId: String(query.playlistId) };
+  if (query.mode !== 'new') return {}; // resume: reuse whatever this scan already targets
+
+  const privacyStatus = PRIVACY_STATUSES.includes(query.privacy) ? query.privacy : 'private';
+  return {
+    create: {
+      title: query.title ? String(query.title) : '',
+      description: query.description ? String(query.description) : '',
+      privacyStatus,
+      tags: query.tags ? String(query.tags).split(',') : [],
+      defaultLanguage: query.language ? String(query.language) : undefined,
+    },
+  };
+}
+
+function createApiServer({ discordClient = null } = {}) {
   const app = express();
   app.use(express.json());
 
@@ -60,28 +113,79 @@ function createApiServer() {
       );
 
       const alreadyConnected = await hasYouTubeTokens(req.discordUserId);
-      res.json({ tracks, alreadyConnected, scanJob });
+      const targetPlaylist = await getSavedPlaylist(req.scanJobId, req.discordUserId);
+      const youtubeChannel = alreadyConnected ? await getYouTubeChannel(req.discordUserId) : null;
+
+      // Prior push outcome per video, scoped to the playlist this scan targets,
+      // so a reloaded page shows which links already landed and which errored.
+      let itemStatuses = {};
+      if (targetPlaylist) {
+        const { rows } = await db.query(
+          `SELECT media_id, status, error, attempts
+           FROM playlist_items
+           WHERE scan_job_id = $1 AND discord_user_id = $2 AND youtube_playlist_id = $3`,
+          [req.scanJobId, req.discordUserId, targetPlaylist.id]
+        );
+        itemStatuses = Object.fromEntries(
+          rows.map(r => [r.media_id, { status: r.status, error: r.error, attempts: r.attempts }])
+        );
+      }
+
+      res.json({
+        tracks,
+        alreadyConnected,
+        scanJob,
+        youtubeChannel,
+        targetPlaylist,
+        itemStatuses,
+        quotaCostPerInsert: INSERT_QUOTA_COST,
+        discord: await resolveNames(discordClient, scanJob),
+      });
     } catch (err) {
       console.error('GET /api/scans/:id failed:', err);
       res.status(500).json({ error: 'internal error' });
     }
   });
 
-  // SSE stream that pushes pending YouTube videos to the user's playlist.
+  // The connected channel's playlists, so the user can add to an existing one
+  // instead of always creating a new playlist.
+  app.get('/api/scans/:id/youtube/playlists', verifyMagicToken, async (req, res) => {
+    try {
+      const playlists = await listPlaylists(req.discordUserId);
+      if (playlists === null) return res.status(409).json({ error: 'no_youtube' });
+      res.json({ playlists, channel: await getYouTubeChannel(req.discordUserId) });
+    } catch (err) {
+      const info = classifyError(err);
+      console.error('GET /api/scans/:id/youtube/playlists failed:', err);
+      res.status(info.reason === 'quotaExceeded' ? 429 : 500)
+        .json({ error: info.reason, message: info.message });
+    }
+  });
+
+  // SSE stream that pushes pending YouTube videos to the chosen playlist.
   // EventSource is GET-only, so this is GET (not POST as some docs show).
   app.get('/api/scans/:id/push', verifyMagicToken, async (req, res) => {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no', // don't let the reverse proxy buffer the stream
     });
+    res.flushHeaders?.();
+
     const emit = (event, data) =>
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     try {
-      await pushPendingToPlaylist(req.scanJobId, req.discordUserId, emit);
+      await pushPendingToPlaylist(
+        req.scanJobId,
+        req.discordUserId,
+        emit,
+        parsePushOptions(req.query)
+      );
     } catch (err) {
       console.error('push failed:', err);
-      emit('error', { code: 'push_failed', message: err.message });
+      const info = classifyError(err);
+      emit('error', { code: info.reason || 'push_failed', message: info.message });
     } finally {
       res.end();
     }
