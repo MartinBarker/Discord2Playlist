@@ -56,7 +56,7 @@ module.exports = {
 
       const token = await issueMagicToken(scanJobId, interaction.user.id);
       const siteOrigin = process.env.SITE_ORIGIN || 'https://martinbarker.me';
-      const url = `${siteOrigin}/discord2playlist/results/${scanJobId}?t=${token}`;
+      const url = `${siteOrigin}/trawl/results/${scanJobId}?t=${token}`;
 
       await outputChannel.send(
         `Found **${totalCount}** track${totalCount === 1 ? '' : 's'}` +
