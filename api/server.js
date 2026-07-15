@@ -173,20 +173,31 @@ function createApiServer({ discordClient = null } = {}) {
     });
     res.flushHeaders?.();
 
-    const emit = (event, data) =>
+    // When the browser closes the stream (Stop button, refresh, or tab close)
+    // the socket 'close' fires; abort so the push loop halts between videos
+    // instead of running on invisibly to completion. `finished` guards against
+    // the 'close' we ourselves trigger with res.end() on normal completion.
+    let finished = false;
+    const ac = new AbortController();
+    res.on('close', () => { if (!finished) ac.abort(); });
+
+    const emit = (event, data) => {
+      if (res.writableEnded) return;
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
     try {
       await pushPendingToPlaylist(
         req.scanJobId,
         req.discordUserId,
         emit,
-        parsePushOptions(req.query)
+        { ...parsePushOptions(req.query), signal: ac.signal }
       );
     } catch (err) {
       console.error('push failed:', err);
       const info = classifyError(err);
       emit('error', { code: info.reason || 'push_failed', message: info.message });
     } finally {
+      finished = true;
       res.end();
     }
   });
