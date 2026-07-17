@@ -47,11 +47,16 @@ async function resolveNames(discordClient, scanJob) {
 // EventSource can only issue GETs with no custom headers, so the playlist choice
 // travels as query params.
 function parsePushOptions(query) {
-  if (query.playlistId) return { playlistId: String(query.playlistId) };
-  if (query.mode !== 'new') return {}; // resume: reuse whatever this scan already targets
+  // Which end of the playlist the newest-shared video lands on. Default 'newest'
+  // puts the most recently shared track at the top (see ORDER BY in youtube.js).
+  const order = query.order === 'oldest' ? 'oldest' : 'newest';
+
+  if (query.playlistId) return { playlistId: String(query.playlistId), order };
+  if (query.mode !== 'new') return { order }; // resume: reuse whatever this scan already targets
 
   const privacyStatus = PRIVACY_STATUSES.includes(query.privacy) ? query.privacy : 'private';
   return {
+    order,
     create: {
       title: query.title ? String(query.title) : '',
       description: query.description ? String(query.description) : '',
