@@ -51,12 +51,17 @@ function parsePushOptions(query) {
   // puts the most recently shared track at the top (see ORDER BY in youtube.js).
   const order = query.order === 'oldest' ? 'oldest' : 'newest';
 
-  if (query.playlistId) return { playlistId: String(query.playlistId), order };
-  if (query.mode !== 'new') return { order }; // resume: reuse whatever this scan already targets
+  // Duplicate prevention is on by default; the results page opts out by sending
+  // allowDuplicates=1 when the user un-checks "skip videos already in playlist".
+  const allowDuplicates = query.allowDuplicates === '1' || query.allowDuplicates === 'true';
+
+  if (query.playlistId) return { playlistId: String(query.playlistId), order, allowDuplicates };
+  if (query.mode !== 'new') return { order, allowDuplicates }; // resume: reuse whatever this scan already targets
 
   const privacyStatus = PRIVACY_STATUSES.includes(query.privacy) ? query.privacy : 'private';
   return {
     order,
+    allowDuplicates,
     create: {
       title: query.title ? String(query.title) : '',
       description: query.description ? String(query.description) : '',
